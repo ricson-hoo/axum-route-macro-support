@@ -1,0 +1,10 @@
+[package]
+name = "axum-route-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+proc-macro2 = "1.0"
+axum = "0.8.0-alpha.1"
+inventory = "0.3.15"
+quote = "1.0.37"
