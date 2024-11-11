@@ -26,13 +26,28 @@ use std::collections::HashSet;
 
 mod route;
 
-static USE_COLLECTOR: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
-    Mutex::new(Vec::new())
+static USE_COLLECTOR: Lazy<Mutex<UseCollector>> = Lazy::new(|| {
+    Mutex::new(UseCollector::new())
 });
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 struct UseCollector {
+    mod_name:String,
     uses: Vec<String>,
+}
+
+impl UseCollector {
+    fn new() -> UseCollector {
+        UseCollector{
+            mod_name:"".to_string(),
+            uses: vec![],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.mod_name = "".to_string();
+        self.uses = vec![];
+    }
 }
 
 fn uses_to_map(use_statements: Vec<String>) -> HashMap<String, String> {
@@ -107,12 +122,16 @@ impl<'ast> Visit<'ast> for UseCollector {
 #[proc_macro_attribute]
 pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // clear the collector
-    USE_COLLECTOR.lock().unwrap().clear();
+    USE_COLLECTOR.lock().unwrap().reset();
 
     // parse the mod's content
     let input = parse_macro_input!(item as ItemMod);
 
+    // Get the module name
+    let mod_name = input.ident.clone().to_string();
+
     let mut collector = UseCollector {
+        mod_name,
         uses: Vec::new(),
     };
 
@@ -120,7 +139,7 @@ pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     //Store the collected use statements in the static USE_COLLECTOR
     let mut collector_lock = USE_COLLECTOR.lock().unwrap();
-    collector_lock.extend(collector.uses.clone());
+    *collector_lock = collector;
 
     // return the orginal mod
     quote! {
@@ -189,14 +208,14 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     // gain a USE_COLLECTOR lock
     let collector_lock = USE_COLLECTOR.lock().unwrap();
 
+    let use_collector = collector_lock.clone();
+
     // from USE_COLLECTOR clone the `uses` statements and convert into a map
-    let collected_uses_map = uses_to_map(collector_lock.clone());
+    let collected_uses_map = uses_to_map(use_collector.uses);
 
     // Collect argument types and names
     let fn_args: Vec<String> = input_fn.sig.inputs.iter().filter_map(|arg| {
         if let FnArg::Typed(pat_type) = arg {
-            //let arg_type = get_fully_qualified_type(&pat_type.ty, &HashMap::new());
-            // Get the name of the argument
             let arg_name = quote! { #pat_type }.to_string().replace(" ","");
             Some(arg_name)
         } else {
@@ -220,6 +239,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.into_compile_error().into(),
     };*/
 
+    let mod_name = use_collector.mod_name.clone();
     let path = routeDef.path;
     let httpd_method = routeDef.method;
     let fn_name = fn_name.to_string();
@@ -228,6 +248,12 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     let dynamic_struct_name = Ident::new(&format!("RouteProvider{}",&fn_name), proc_macro2::Span::call_site());
     let method_ident = Ident::new(&format!("{}",&httpd_method), proc_macro2::Span::call_site());
     let handler_ident = Ident::new(&format!("{}",&fn_name), proc_macro2::Span::call_site());
+
+    let is_to_expand = !routeDef.options.contains_key("non_api");
+
+    let original = quote! {
+        #input_fn // Keep the original function
+    };
 
     // Generate the FnInfo struct
     let expanded = quote! {
@@ -242,7 +268,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
                 router.route(#path,axum::routing::#method_ident(#handler_ident))
             }
             fn get_route(&self) -> axum_route_helper::RouteMethodDesc {
-                axum_route_helper::RouteMethodDesc::new(#path.to_string(),#httpd_method.to_string(),#fn_name.to_string(),#fn_args.to_string(),#fn_return_type.to_string(),#use_statements.to_string())
+                axum_route_helper::RouteMethodDesc::new(#mod_name.to_string(),#path.to_string(),#httpd_method.to_string(),#fn_name.to_string(),#fn_args.to_string(),#fn_return_type.to_string(),#use_statements.to_string())
             }
         }
 
@@ -255,7 +281,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     diagnostic.set_spans(vec![Span::def_site()]);
     diagnostic.emit(); // 发出Help
 
-    TokenStream::from(expanded)
+    if is_to_expand {TokenStream::from(expanded)} else {TokenStream::from(original)}
 }
 
 

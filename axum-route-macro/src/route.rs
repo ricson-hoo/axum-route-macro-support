@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use std::collections::HashMap;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, ToTokens};
 use syn::{punctuated::Punctuated, LitStr, Path, Token};
@@ -7,25 +8,22 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-
-
-#[derive(Debug)]
+/*#[derive(Debug)]
 pub struct RouteOption{
     pub name:String,
     pub value:String,
 }
-
 impl RouteOption{
     pub fn new(name:String,value:String)->Self{
         RouteOption{name,value}
     }
-}
+}*/
 
 #[derive(Debug)]
 pub struct RouteDef {
     pub path: String,
     pub method: String,
-    pub options: Vec<RouteOption>,
+    pub options: HashMap<String,String>,
 }
 
 impl syn::parse::Parse for RouteDef {
@@ -42,7 +40,7 @@ impl syn::parse::Parse for RouteDef {
         let possible_methods = vec!["get".to_string(), "post".to_string(), "put".to_string(),"delete".to_string(),"head".to_string(),"options".to_string(),"trace".to_string(),"patch".to_string()];
 
         let mut method = "".to_string();
-        let mut options = Vec::new();
+        let mut options = HashMap::new();
 
         // Check for the next token
         let next_token: Result<Token![,], _> = input.parse();
@@ -64,10 +62,7 @@ impl syn::parse::Parse for RouteDef {
                             if meta_name == "method".to_string() {
                                 method = meta_value;
                             }else{
-                                options.push(RouteOption::new(
-                                    meta_name,
-                                    meta_value,
-                                ));
+                                options.insert(meta_name, meta_value);
                             }
                         }
                     } else {
@@ -90,7 +85,7 @@ impl syn::parse::Parse for RouteDef {
                 return Ok(Self {
                     path,
                     method,
-                    options: vec![],
+                    options: HashMap::new(),
                 });
             },
         };
