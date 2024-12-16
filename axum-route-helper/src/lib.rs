@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::{fs, io};
 use std::path::Path;
@@ -114,18 +114,24 @@ pub fn generate_api_client(conf:ApiClientCodeGenConf) -> io::Result<()>{
     for route in routes {
         grouped_routes.entry(route.mod_name.clone()).or_default().push(route);
     }
-    let skip_statements = vec!["axum::Json","axum::extract::Path","axum::extract::Query"];
+    let skip_statements = vec!["axum::Json","axum::extract::Path","axum::extract::Query","axum_extra::extract::Query"];
+    let mut mod_names:Vec<String> = vec![];
+
     // Iterate over each group and generate the corresponding file
     for (mod_name, method_descs) in grouped_routes {
+        mod_names.push(mod_name.clone());
         // Create the output file path
         let file_name = format!("{}_api_client.rs", mod_name);
         let file_path = dir_path.join(file_name);
         let mut file = File::create(&file_path)?;
 
         // Write distinct use statements
-        let use_statements = method_descs.first().map_or("", |desc| &desc.use_statements);
+        let use_statements = method_descs.iter() // Iterate over the elements in method_descs
+            .map(|desc| desc.use_statements.clone()) // Extract the use_statements field
+            .collect::<Vec<String>>() // Collect into a Vec<&str>
+            .join(";"); // Join the Vec with "; " as separator
 
-        let statements: Vec<String> = use_statements.split(';')
+        let statements: HashSet<String> = use_statements.split(';')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty() && !skip_statements.contains(s))
             .map(|s| format!("use {};", s))
@@ -146,6 +152,16 @@ pub fn generate_api_client(conf:ApiClientCodeGenConf) -> io::Result<()>{
             writeln!(file, "{}\n", fn_code)?;
         }
     }
+
+    //create a mod.rs
+    let file_path = dir_path.join("mod.rs".to_string());
+    let mut file = File::create(&file_path)?;
+
+    // Write each mod declaration
+    for mod_name in mod_names {
+        writeln!(file, "pub mod {}_api_client;",mod_name)?;
+    }
+
     Ok(())
 }
 
@@ -218,6 +234,18 @@ fn generate_fn_code(desc: &RouteMethodDesc) -> String {
         fn_return_data_type = fn_return_data_type.trim_start_matches("PagingResponse<").trim_end_matches('>').to_string();
     }
 
+    //there might be nested generic types
+    if fn_return_data_type.contains("<") {
+        // Count the number of '<' characters
+        let count = fn_return_data_type.chars().filter(|&c| c == '<').count();
+
+        // Generate the corresponding number of '>' characters
+        let closing_brackets = ">".repeat(count);
+
+        // Combine the original string with the closing brackets
+        fn_return_data_type = format!("{}{}", fn_return_data_type, closing_brackets);
+    }
+
     let path = if path.contains("{") { //e.g., /api/product/{id}/{action}
         //should be format!("/api/product/{}/{}",id,action)
         path.to_string()
@@ -269,6 +297,11 @@ fn generate_http_client_call(http_method:String, mut path:String, fn_args_info:V
                 path = path.replace(&pattern,"{}");
                 path_params.push(it.name.clone());
             },
+            FnArgValueForm::QueryString => {
+                if body.is_none() {
+                    body = Some(it.clone());
+                }
+            },
             _ => {
                 query_string_params.push(it.name.clone());
             }
@@ -285,14 +318,14 @@ fn generate_http_client_call(http_method:String, mut path:String, fn_args_info:V
     }
 
     //post body
-    if method == "post" {
+    //if method == "post" {
         if body.is_some() {
             http_client_call.push_str(", &");
             http_client_call.push_str(&format!("Some({})",body.unwrap().name.as_str()));
         }else {
             http_client_call.push_str(", &Option::<i8>::None");
         }
-    }
+    //}
 
     //params
     if query_string_params.len() > 0 {
@@ -355,6 +388,9 @@ fn parts_fn_args_names_and_types(fn_args: String) -> Vec<FnArgInfo> {
         let cleaned_names_str = if names_str.starts_with("Json(") {
             value_form = FnArgValueForm::Json;
             &names_str[5..names_str.len() - 1] // Remove "Json(" prefix and ")" suffix
+        } else if names_str.starts_with("Query(") {
+            value_form = FnArgValueForm::QueryString;
+            &names_str[6..names_str.len() - 1] // Remove "Json(" prefix and ")" suffix
         } else if names_str.starts_with("Path(") {
             value_form = FnArgValueForm::Path;
             let inner = &names_str[5..names_str.len() - 1]; // Remove "Path(" prefix and ")" suffix
@@ -374,6 +410,8 @@ fn parts_fn_args_names_and_types(fn_args: String) -> Vec<FnArgInfo> {
         // Clean up types_str
         let cleaned_types_str = if types_str.starts_with("Json<") {
             &types_str[5..types_str.len() - 1] // Remove "Json<" and ">"
+        }else if types_str.starts_with("Query<") {
+            &types_str[6..types_str.len() - 1] // Remove "Json<" and ">"
         } else if types_str.starts_with("Path<") {
             let inner = &types_str[5..types_str.len() - 1]; // Remove "Path<" and ">"
             if inner.starts_with('(') && inner.ends_with(')') {

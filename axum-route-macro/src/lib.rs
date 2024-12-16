@@ -23,17 +23,18 @@ use once_cell::sync::Lazy;
 use syn::ItemMod;
 use proc_macro2::Ident;
 use std::collections::HashSet;
+use std::io::BufRead;
 
 mod route;
 
-static USE_COLLECTOR: Lazy<Mutex<UseCollector>> = Lazy::new(|| {
-    Mutex::new(UseCollector::new())
+static USE_COLLECTOR_MAP: Lazy<Mutex<HashMap<String,UseCollector>>> = Lazy::new(|| {
+    Mutex::new(HashMap::new())
 });
 
 #[derive(Debug,Clone)]
 struct UseCollector {
     mod_name:String,
-    uses: Vec<String>,
+    pub uses: Vec<String>,
 }
 
 impl UseCollector {
@@ -43,10 +44,14 @@ impl UseCollector {
             uses: vec![],
         }
     }
+}
 
-    fn reset(&mut self) {
-        self.mod_name = "".to_string();
-        self.uses = vec![];
+impl<'ast> Visit<'ast> for UseCollector {
+    fn visit_item_use(&mut self, node: &'ast ItemUse) {
+        let full_path = node.to_token_stream().to_string(); // Capture the full path first
+        self.uses.push(full_path);
+        // Continue visiting the node's children
+        syn::visit::visit_item_use(self, node);
     }
 }
 
@@ -101,15 +106,6 @@ fn uses_to_map(use_statements: Vec<String>) -> HashMap<String, String> {
     result_map
 }
 
-impl<'ast> Visit<'ast> for UseCollector {
-    fn visit_item_use(&mut self, node: &'ast ItemUse) {
-        let full_path = node.to_token_stream().to_string(); // Capture the full path first
-        self.uses.push(full_path);
-        // Continue visiting the node's children
-        syn::visit::visit_item_use(self, node);
-    }
-}
-
 /// A macro to parse the `use` statements of a module.
 /// For this to work, you must define a module with code immediately following.
 /// For example:
@@ -121,30 +117,60 @@ impl<'ast> Visit<'ast> for UseCollector {
 /// ```
 #[proc_macro_attribute]
 pub fn handlers(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // clear the collector
-    USE_COLLECTOR.lock().unwrap().reset();
+
+    let mut use_collector_map = USE_COLLECTOR_MAP.lock().unwrap();
 
     // parse the mod's content
     let input = parse_macro_input!(item as ItemMod);
 
-    // Get the module name
+    // Get the module file path and name
+    let span = Span::call_site();
+    let source = span.source_file();
+    let file_path = source.path().to_str().unwrap().to_string();
+    let mut map_key = file_path.clone();
     let mod_name = input.ident.clone().to_string();
 
     let mut collector = UseCollector {
-        mod_name,
+        mod_name: mod_name.clone(),
         uses: Vec::new(),
     };
 
+    //collect use statements directly written inside pub mod xxx{ use .... }
     collector.visit_item_mod(&input);
 
-    //Store the collected use statements in the static USE_COLLECTOR
-    let mut collector_lock = USE_COLLECTOR.lock().unwrap();
-    *collector_lock = collector;
+    //collect use statements written at a separate file xxx.rs
+    // Construct the path to a.rs based on the current module
+    let extra_file_path = std::path::Path::new(&file_path)
+        .parent()
+        .unwrap()
+        .join(format!("{}.rs",mod_name))
+        .to_str().unwrap().to_string();
+
+    // Try to read the content of a.rs and handle errors
+    match std::fs::read_to_string(&extra_file_path.clone()) {
+        Ok(source) => {
+            map_key = extra_file_path;
+            // Collect use statements
+            for line in source.lines() {
+                let trimmed_line = line.trim();
+                if trimmed_line.starts_with("use ") {
+                    collector.uses.push(trimmed_line.to_string());
+                }
+            }
+        },
+        Err(e) => {
+            //eprintln!("Failed to read file {}: {}", file_path, e);
+        }
+    };
+
+    //Store the collected use statements in the static USE_COLLECTOR_MAP
+    use_collector_map.insert(map_key, collector);
 
     // return the orginal mod
-    quote! {
+    let original = quote! {
         #input
-    }.into()
+    };
+    original.into()
 }
 
 fn filter_use_statements(
@@ -195,6 +221,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let span = Span::call_site();
     let source = span.source_file();
+    let file_path = source.path().to_str().unwrap().to_string();
     msgs.push(format!("file path {}",source.path().to_str().unwrap()));
 
     //extract the route's method and path
@@ -205,10 +232,14 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     msgs.push(format!("attr parsed routeDef {:#?}",routeDef));
 
-    // gain a USE_COLLECTOR lock
-    let collector_lock = USE_COLLECTOR.lock().unwrap();
+    // gain a USE_COLLECTOR_MAP lock
+    let collector_map = USE_COLLECTOR_MAP.lock().unwrap();
 
-    let use_collector = collector_lock.clone();
+    let mut use_collector = UseCollector::new();
+
+    if let Some(uc) = collector_map.get(&file_path) {
+        use_collector = uc.clone();
+    }
 
     // from USE_COLLECTOR clone the `uses` statements and convert into a map
     let collected_uses_map = uses_to_map(use_collector.uses);
@@ -232,7 +263,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     let use_statements = filter_use_statements(collected_uses_map.clone(),fn_args.clone(),fn_return_type.clone());
 
     // Prepare message output
-    msgs.push(format!("fn args {:#?}, return type {:#?}, use_statements {:#?}", fn_args, fn_return_type,use_statements));
+    msgs.push(format!("fn args {:#?}, return type {:#?}, use_statements {:#?}, collector_map {:#?}", file_path, fn_args, fn_return_type, use_statements));
 
     /*let ast = match syn::parse::<syn::ItemFn>(item.clone()) {
         Ok(ast) => ast,
